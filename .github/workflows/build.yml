@@ -1,0 +1,48 @@
+name: YALDA Core Linux Kernel Builder
+
+on:
+  workflow_dispatch: # Lets you click a button on GitHub to start compilation manually
+
+jobs:
+  compile-kernel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Your Repository Code
+        uses: actions/checkout@v4
+
+      - name: Install Cloud Compiler Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev xz-utils git wget
+
+      - name: Download Kernel Source Code
+        run: |
+          # Fetching the exact kernel version matching your local config
+          wget https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.14.11.tar.xz
+          tar -xf linux-6.14.11.tar.xz
+          echo "KERNEL_DIR=linux-6.14.11" >> $GITHUB_ENV
+
+      - name: Inject Custom Config and Compile
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          
+          # 1. Copy your custom .config from your repo into the cloud source tree
+          cp ../.config ./.config
+          
+          # 2. Tell the cloud builder to validate your settings safely
+          make olddefconfig 
+          
+          # 3. Crunch through the build using all available CPU threads
+          make -j$(nproc) bzImage
+
+      - name: Collect Kernel Artifacts
+        run: |
+          mkdir output
+          cp ${{ env.KERNEL_DIR }}/arch/x86/boot/bzImage ./output/vmlinuz-yalda-core
+
+      - name: Ship Finished Binary Back to Your PC
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-compiled-kernel
+          path: ./output/vmlinuz-yalda-core
