@@ -1,0 +1,339 @@
+name: Usine de Compilation YALDA From Scratch (Ordre Croissant)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+# Fonctions partagées par tous les jobs (téléchargement avec liens de secours)
+env:
+  DLFUNC: |
+    # dl <fichier-sortie> <url1> [url2 ...] : essaie chaque URL jusqu'à la première qui marche
+    dl() {
+      out="$1"; shift
+      for u in "$@"; do
+        echo ">> $u"
+        if curl -fsSL --retry 3 --retry-delay 3 -o "$out" "$u"; then return 0; fi
+      done
+      echo "Aucun lien valide pour $out" >&2
+      return 1
+    }
+    # unpack <archive> <dossier> : extrait sans le dossier racine de l'archive
+    unpack() { mkdir -p "$2"; tar -xf "$1" -C "$2" --strip-components=1; }
+    # aptsoft <paquets...> : installe paquet par paquet, un paquet inconnu ne bloque pas tout
+    aptsoft() {
+      sudo apt-get update -qq
+      for p in "$@"; do
+        sudo apt-get install -y --no-install-recommends "$p" || echo "::warning::paquet apt ignoré : $p"
+      done
+    }
+
+jobs:
+  # =========================================================
+  # ETAPE 1 : OPENRC (L'Initialisation Système)
+  # =========================================================
+  build-1-openrc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code de YALDA
+        uses: actions/checkout@v4
+
+      - name: Installer les dépendances de base
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build libselinux1-dev
+
+      - name: Cloner et Compiler OpenRC (Branche Master)
+        run: |
+          git clone --branch master --single-branch https://github.com/OpenRC/openrc
+          cd openrc
+          meson setup builddir --prefix=/ --sbindir=/sbin
+          ninja -C builddir
+          DESTDIR=$GITHUB_WORKSPACE/artifacts/openrc ninja -C builddir install
+
+      - name: Empaqueter OpenRC
+        run: tar -C "$GITHUB_WORKSPACE/artifacts/openrc" -czpf "$GITHUB_WORKSPACE/openrc.tar.gz" .
+
+      - name: Sauvegarder l'artifact OpenRC
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-1-openrc
+          path: ${{ github.workspace }}/openrc.tar.gz
+
+  # =========================================================
+  # ETAPE 2 : GLIBC (La Bibliothèque C Fondamentale)
+  # =========================================================
+  build-2-glibc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Installer les outils de build GNU
+        run: sudo apt-get update && sudo apt-get install -y build-essential bison gawk texinfo python3 gettext
+
+      - name: Cloner et Compiler Glibc (Sourceware Git)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://sourceware.org/git/glibc.git glibc-src \
+            || git clone --depth 1 https://github.com/bminor/glibc.git glibc-src
+          mkdir glibc-build
+          cd glibc-build
+          ../glibc-src/configure --prefix=/usr --disable-werror
+          make -j"$(nproc)"
+          # glibc utilise install_root (et non DESTDIR) pour installer dans un dossier temporaire
+          make install install_root="$GITHUB_WORKSPACE/artifacts/glibc"
+
+      - name: Empaqueter Glibc
+        run: tar -C "$GITHUB_WORKSPACE/artifacts/glibc" -czpf "$GITHUB_WORKSPACE/glibc.tar.gz" .
+
+      - name: Sauvegarder l'artifact Glibc
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-2-glibc
+          path: ${{ github.workspace }}/glibc.tar.gz
+
+  # =========================================================
+  # ETAPE 3 : DEPENDANCES GRAPHIQUES CRITIQUES (X11 Core Requirements)
+  # =========================================================
+  build-3-requirements:
+    runs-on: ubuntu-latest
+    needs: build-2-glibc
+    steps:
+      - name: Installer les dépendances hôtes
+        run: |
+          eval "$DLFUNC"
+          aptsoft build-essential meson ninja-build pkg-config xsltproc libxml2-utils python3 \
+            libexpat1-dev libx11-dev libegl-dev libgl-dev \
+            gperf libcap-dev libmount-dev libudev-dev libacl1-dev libpam0g-dev python3-jinja2
+
+      - name: Télécharger et Compiler les modules Requis
+        run: |
+          set -euo pipefail
+          eval "$DLFUNC"
+          STAGE="$GITHUB_WORKSPACE/artifacts/req"
+          mkdir -p "$STAGE" "$GITHUB_WORKSPACE/build-dir"
+          cd "$GITHUB_WORKSPACE/build-dir"
+
+          # 1. Pixman (Rendu 2D)
+          dl pixman.tar.gz \
+            "https://www.cairographics.org/releases/pixman-0.46.4.tar.gz" \
+            "https://gitlab.freedesktop.org/pixman/pixman/-/archive/pixman-0.46.4/pixman-0.46.4.tar.gz"
+          unpack pixman.tar.gz pixman
+          (cd pixman && meson setup builddir --prefix=/usr --buildtype=release && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+          # 2. Libxcvt (Calculs de résolutions d'écran)
+          dl libxcvt.tar.xz \
+            "https://xorg.freedesktop.org/archive/individual/lib/libxcvt-0.1.3.tar.xz" \
+            "https://www.x.org/releases/individual/lib/libxcvt-0.1.3.tar.xz"
+          unpack libxcvt.tar.xz libxcvt
+          (cd libxcvt && meson setup builddir --prefix=/usr --buildtype=release && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+          # 3. Libtirpc (Gestion RPC pour l'affichage)
+          dl libtirpc.tar.bz2 \
+            "https://downloads.sourceforge.net/project/libtirpc/libtirpc/1.3.8/libtirpc-1.3.8.tar.bz2" \
+            "https://sourceforge.net/projects/libtirpc/files/libtirpc/1.3.8/libtirpc-1.3.8.tar.bz2/download"
+          unpack libtirpc.tar.bz2 libtirpc
+          (cd libtirpc && ./configure --prefix=/usr --sysconfdir=/etc --disable-gssapi \
+            && make -j"$(nproc)" && make install DESTDIR="$STAGE")
+
+          # 4. Libepoxy (Pointeur OpenGL)
+          dl libepoxy.tar.xz \
+            "https://download.gnome.org/sources/libepoxy/1.5/libepoxy-1.5.10.tar.xz"
+          unpack libepoxy.tar.xz libepoxy
+          (cd libepoxy && meson setup builddir --prefix=/usr --buildtype=release && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+          # 5. D-Bus (Communication inter-processus XFCE)
+          dl dbus.tar.xz \
+            "https://dbus.freedesktop.org/releases/dbus/dbus-1.16.2.tar.xz"
+          unpack dbus.tar.xz dbus
+          (cd dbus && meson setup builddir --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+            --buildtype=release -Dsystemd=disabled && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+          # 6. Elogind (Gestion des sessions utilisateurs sans systemd)
+          dl elogind.tar.gz \
+            "https://github.com/elogind/elogind/archive/refs/tags/v257.16.tar.gz"
+          unpack elogind.tar.gz elogind
+          (cd elogind && meson setup builddir --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+            --buildtype=release -Dman=false && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+      - name: Empaqueter les dépendances graphiques
+        run: tar -C "$GITHUB_WORKSPACE/artifacts/req" -czpf "$GITHUB_WORKSPACE/req.tar.gz" .
+
+      - name: Sauvegarder les dépendances graphiques
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-3-req
+          path: ${{ github.workspace }}/req.tar.gz
+
+  # =========================================================
+  # ETAPE 4 : XORG SERVER (Le Serveur Visuel)
+  # =========================================================
+  build-4-xorg:
+    runs-on: ubuntu-latest
+    needs: [build-2-glibc, build-3-requirements]
+    steps:
+      - name: Installer les bibliothèques de dev X11
+        run: |
+          eval "$DLFUNC"
+          aptsoft build-essential pkg-config xorg-dev xutils-dev libtool automake autoconf meson ninja-build \
+            libpixman-1-dev libepoxy-dev libxcvt-dev libtirpc-dev libdbus-1-dev libudev-dev libdrm-dev \
+            libgbm-dev libgl-dev libxshmfence-dev libpciaccess-dev libxfont-dev libxkbfile-dev \
+            libinput-dev xserver-xorg-dev xfonts-utils python3
+
+      - name: Compiler Xorg-Server et les Configurations Clavier
+        run: |
+          set -euo pipefail
+          eval "$DLFUNC"
+          STAGE="$GITHUB_WORKSPACE/artifacts/xorg"
+          mkdir -p "$STAGE" "$GITHUB_WORKSPACE/build-dir"
+          cd "$GITHUB_WORKSPACE/build-dir"
+
+          # 1. Serveur Xorg : on essaie 21.1.25 puis des versions plus anciennes de la série 21.1
+          XORG_VER=""
+          for v in 21.1.25 21.1.24 21.1.23 21.1.22 21.1.21; do
+            if dl xorg-server.tar.xz \
+                "https://xorg.freedesktop.org/archive/individual/xserver/xorg-server-$v.tar.xz" \
+                "https://www.x.org/releases/individual/xserver/xorg-server-$v.tar.xz"; then
+              XORG_VER="$v"; break
+            fi
+          done
+          [ -n "$XORG_VER" ] || { echo "::error::Aucune version de xorg-server 21.1.x trouvée"; exit 1; }
+          echo "xorg-server utilisé : $XORG_VER"
+          unpack xorg-server.tar.xz xorg-server
+          (cd xorg-server && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+            --disable-docs --disable-devel-docs --disable-systemd-logind \
+            && make -j"$(nproc)" && make install DESTDIR="$STAGE")
+
+          # 2. Pilote d'entrée (Libinput pour souris/clavier)
+          dl libinput-driver.tar.xz \
+            "https://xorg.freedesktop.org/archive/individual/driver/xf86-input-libinput-1.5.0.tar.xz" \
+            "https://www.x.org/releases/individual/driver/xf86-input-libinput-1.5.0.tar.xz"
+          unpack libinput-driver.tar.xz libinput-driver
+          (cd libinput-driver && ./configure --prefix=/usr \
+            && make -j"$(nproc)" && make install DESTDIR="$STAGE")
+
+          # 3. Mappage clavier (xkeyboard-config utilise meson)
+          dl xkeyboard-config.tar.xz \
+            "https://xorg.freedesktop.org/archive/individual/data/xkeyboard-config/xkeyboard-config-2.48.tar.xz" \
+            "https://www.x.org/releases/individual/data/xkeyboard-config/xkeyboard-config-2.48.tar.xz"
+          unpack xkeyboard-config.tar.xz xkeyboard-config
+          (cd xkeyboard-config && meson setup builddir --prefix=/usr --buildtype=release && ninja -C builddir \
+            && DESTDIR="$STAGE" ninja -C builddir install)
+
+          # 4. Polices d'écriture X11 par défaut
+          dl font-type1.tar.xz \
+            "https://xorg.freedesktop.org/archive/individual/font/font-xfree86-type1-1.0.5.tar.xz" \
+            "https://www.x.org/releases/individual/font/font-xfree86-type1-1.0.5.tar.xz"
+          unpack font-type1.tar.xz font-type1
+          (cd font-type1 && ./configure --prefix=/usr --with-fontrootdir=/usr/share/fonts/X11 \
+            && make -j"$(nproc)" && make install DESTDIR="$STAGE")
+
+      - name: Empaqueter Xorg
+        run: tar -C "$GITHUB_WORKSPACE/artifacts/xorg" -czpf "$GITHUB_WORKSPACE/xorg.tar.gz" .
+
+      - name: Sauvegarder l'artifact Xorg
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-4-xorg
+          path: ${{ github.workspace }}/xorg.tar.gz
+
+  # =========================================================
+  # ETAPE 5 : XFCE 4.20 (L'Environnement de Bureau Complet)
+  # =========================================================
+  # Le fat tarball XFCE contient les archives de chaque composant dans src/ ;
+  # elles sont compilées une par une dans l'ordre des dépendances.
+  build-5-xfce:
+    runs-on: ubuntu-latest
+    needs: [build-2-glibc, build-4-xorg]
+    steps:
+      - name: Installer les dépendances de compilation de XFCE
+        run: |
+          eval "$DLFUNC"
+          aptsoft build-essential pkg-config gettext libtool automake autoconf \
+            libglib2.0-dev libgtk-3-dev libwnck-3-dev libwayland-dev wayland-protocols libgtk-layer-shell-dev \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev libxfixes-dev libxcomposite-dev \
+            libxdamage-dev libxres-dev libxpresent-dev libsm-dev libice-dev libx11-xcb-dev \
+            libxklavier-dev libcolord-dev libnotify-dev libupower-glib-dev libgudev-1.0-dev \
+            libexif-dev libpcre2-dev libyaml-dev libstartup-notification0-dev libepoxy-dev \
+            libpolkit-gobject-1-dev libdbus-glib-1-dev liburi-perl libgirepository1.0-dev \
+            libgstreamer1.0-dev libpoppler-glib-dev libgdk-pixbuf-2.0-dev libcairo2-dev
+
+      - name: Télécharger le Fat Tarball XFCE 4.20 et compiler tous les composants
+        run: |
+          set -euo pipefail
+          eval "$DLFUNC"
+          STAGE="$GITHUB_WORKSPACE/artifacts/xfce"
+          mkdir -p "$STAGE" "$GITHUB_WORKSPACE/build-dir"
+          cd "$GITHUB_WORKSPACE/build-dir"
+          export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/share/pkgconfig
+
+          # Le fat tarball contient un dossier src/ avec les 17 archives des composants (4.20.0)
+          dl xfce-4.20.tar.bz2 "https://archive.xfce.org/xfce/4.20/fat_tarballs/xfce-4.20.tar.bz2"
+          mkdir -p fat
+          tar -xjf xfce-4.20.tar.bz2 -C fat
+          SRC="$(find fat -type d -name src | head -n 1)"
+          echo "Archives trouvées dans $SRC :"
+          ls "$SRC"
+
+          # Ordre des dépendances : bibliothèques d'abord, applications ensuite
+          # (xfce4-dev-tools est inutile pour des archives de release, on le saute)
+          for name in \
+            libxfce4util xfconf libxfce4windowing libxfce4ui garcon exo tumbler \
+            xfce4-panel thunar thunar-volman xfce4-appfinder xfce4-settings \
+            xfwm4 xfce4-session xfdesktop xfce4-power-manager
+          do
+            archive="$(ls "$SRC/$name"-4.*.tar.bz2 | sort -V | tail -n 1)"
+            echo "=== $name : $archive ==="
+            unpack "$archive" "src-$name"
+            (
+              cd "src-$name"
+              ./configure --prefix=/usr --sysconfdir=/etc
+              make -j"$(nproc)"
+              make install DESTDIR="$STAGE"
+              # Installation aussi sur la machine de build : les composants suivants en dépendent
+              sudo make install
+              sudo ldconfig
+            )
+          done
+
+      - name: Empaqueter XFCE
+        run: tar -C "$GITHUB_WORKSPACE/artifacts/xfce" -czpf "$GITHUB_WORKSPACE/xfce.tar.gz" .
+
+      - name: Sauvegarder l'artifact XFCE 4.20
+        uses: actions/upload-artifact@v4
+        with:
+          name: yalda-5-xfce
+          path: ${{ github.workspace }}/xfce.tar.gz
+
+  # =========================================================
+  # ETAPE 6 : REGROUPEMENT ET ARCHIVE FINALE DU SYSTEME
+  # =========================================================
+  assemble-6-yalda:
+    runs-on: ubuntu-latest
+    needs: [build-1-openrc, build-2-glibc, build-3-requirements, build-4-xorg, build-5-xfce]
+    steps:
+      - name: Télécharger toutes les étapes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: yalda-*
+          path: ${{ github.workspace }}/parts
+
+      - name: Fusionner dans le Rootfs (ordre 1 à 5, permissions conservées)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/rootfs"
+          for f in $(ls "$GITHUB_WORKSPACE"/parts/*/*.tar.gz | sort); do
+            echo "Fusion de $f"
+            sudo tar -xzpf "$f" -C "$GITHUB_WORKSPACE/rootfs"
+          done
+
+      - name: Packager l'archive globale du Rootfs de YALDA
+        run: sudo tar -C "$GITHUB_WORKSPACE/rootfs" -czpf "$GITHUB_WORKSPACE/yalda-complete-rootfs.tar.gz" .
+
+      - name: Publier le pack final téléchargeable
+        uses: actions/upload-artifact@v4
+        with:
+          name: YALDA-CORE-OS-x86_64
+          path: ${{ github.workspace }}/yalda-complete-rootfs.tar.gz
+          compression-level: 0
